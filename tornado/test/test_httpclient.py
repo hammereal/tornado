@@ -6,5 +6,5 @@ def handle_request(response):
     ioloop.IOLoop.instance().stop()
     
 http_client = httpclient.AsyncHTTPClient()
-http_client.fetch("www.python.org", handle_request)
+http_client.fetch("http://www.python.org/", handle_request)
 ioloop.IOLoop.instance().start()
