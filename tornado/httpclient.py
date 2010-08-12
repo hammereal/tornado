@@ -29,6 +29,10 @@ import pycurl
 import sys
 import time
 import weakref
+import urlparse
+import socket
+import iostream
+import functools
 
 from tornado import escape
 from tornado import httputil
@@ -82,6 +86,106 @@ class HTTPClient(object):
             raise CurlError(*e)
 
 
+class HTTPConnection(object):
+    """Handles a connection to an HTTP client, executing HTTP requests.
+
+    We parse HTTP headers and bodies, and execute the request callback
+    until the HTTP conection is closed.
+    """
+    def __init__(self, socket=None, stream=None, netloc=None, callback=None, no_keep_alive=False,
+                 xheaders=False):
+        self.socket = socket
+        self.stream = stream
+        self.netloc = netloc
+        self.callback = callback
+        self.no_keep_alive = no_keep_alive
+        self.xheaders = xheaders
+        self.request = None
+        self.response = None
+        self._request_finished = False
+        #self.stream.read_until("\r\n\r\n", self._on_headers)
+        
+    def write(self, chunk):
+        if not self.stream.closed():
+            self.stream.write(chunk, self._on_write_complete)
+
+    def finish(self):
+        assert self._request, "Request closed"
+        self._request_finished = True
+        if not self.stream.writing():
+            self._finish_request()
+
+    def _on_write_complete(self):
+        if not self.stream.closed():
+            self.stream.read_until("\r\n\r\n", self._on_header_complete)
+            
+    def _on_header_complete(self, header):
+        eol = header.find("\r\n")
+        start_line = header[:eol]
+        version, code, msg = start_line.split(" ")
+        if code != "200":
+            # something wrong
+            pass
+        headers = httputil.HTTPHeaders.parse(header[eol:])
+        
+        self.response = HTTPResponse(
+                request=self.request, code=int(code), headers=headers)
+        
+        content_length = headers.get("Content-Length")
+        if content_length:
+            content_length = int(content_length)
+            if content_length > self.stream.max_buffer_size:
+                raise Exception("Content-Length too long")
+            self.stream.read_bytes(content_length, self._on_body_complete)
+            return
+        
+    def _on_body_complete(self, body):
+        self.response.buffer = cStringIO.StringIO(body)
+        self.callback(self.response)
+
+    def _finish_request(self):
+        if self.no_keep_alive:
+            disconnect = True
+        else:
+            connection_header = self._request.headers.get("Connection")
+            if self._request.supports_http_1_1():
+                disconnect = connection_header == "close"
+            elif ("Content-Length" in self._request.headers
+                    or self._request.method in ("HEAD", "GET")):
+                disconnect = connection_header != "Keep-Alive"
+            else:
+                disconnect = True
+        self._request = None
+        self._request_finished = False
+        if disconnect:
+            self.stream.close()
+            return
+        self.stream.read_until("\r\n\r\n", self._on_headers)
+
+    def _on_headers(self, data):
+        eol = data.find("\r\n")
+        start_line = data[:eol]
+        method, uri, version = start_line.split(" ")
+        if not version.startswith("HTTP/"):
+            raise Exception("Malformed HTTP version in HTTP Request-Line")
+        headers = httputil.HTTPHeaders.parse(data[eol:])
+        self._request = HTTPRequest(
+            connection=self, method=method, uri=uri, version=version,
+            headers=headers, remote_ip=self.address[0])
+
+        content_length = headers.get("Content-Length")
+        if content_length:
+            content_length = int(content_length)
+            if content_length > self.stream.max_buffer_size:
+                raise Exception("Content-Length too long")
+            if headers.get("Expect") == "100-continue":
+                self.stream.write("HTTP/1.1 100 (Continue)\r\n\r\n")
+            self.stream.read_bytes(content_length, self._on_request_body)
+            return
+
+        self.request_callback(self._request)
+
+
 class AsyncHTTPClient(object):
     """An non-blocking HTTP client backed with pycurl.
 
@@ -118,38 +222,38 @@ class AsyncHTTPClient(object):
         else:
             instance = super(AsyncHTTPClient, cls).__new__(cls)
             instance.io_loop = io_loop
-            instance._multi = pycurl.CurlMulti()
-            instance._multi.setopt(pycurl.M_TIMERFUNCTION,
-                                   instance._set_timeout)
-            instance._multi.setopt(pycurl.M_SOCKETFUNCTION,
-                                   instance._handle_socket)
-            instance._curls = [_curl_create(max_simultaneous_connections)
-                               for i in xrange(max_clients)]
-            instance._free_list = instance._curls[:]
+            #instance._multi = pycurl.CurlMulti()
+            #instance._multi.setopt(pycurl.M_TIMERFUNCTION,
+            #                       instance._set_timeout)
+            #instance._multi.setopt(pycurl.M_SOCKETFUNCTION,
+            #                       instance._handle_socket)
+            #instance._curls = [_curl_create(max_simultaneous_connections)
+            #                   for i in xrange(max_clients)]
+            instance._free_list = [HTTPConnection() for i in xrange(max_clients)]
             instance._requests = collections.deque()
             instance._fds = {}
             instance._timeout = None
             cls._ASYNC_CLIENTS[io_loop] = instance
 
-            try:
-                instance._socket_action = instance._multi.socket_action
-            except AttributeError:
+            #try:
+            #    instance._socket_action = instance._multi.socket_action
+            #except AttributeError:
                 # socket_action is found in pycurl since 7.18.2 (it's been
                 # in libcurl longer than that but wasn't accessible to
                 # python).
-                logging.warning("socket_action method missing from pycurl; "
-                                "falling back to socket_all. Upgrading "
-                                "libcurl and pycurl will improve performance")
-                instance._socket_action = \
-                    lambda fd, action: instance._multi.socket_all()
+            #    logging.warning("socket_action method missing from pycurl; "
+            #                    "falling back to socket_all. Upgrading "
+            #                    "libcurl and pycurl will improve performance")
+            #    instance._socket_action = \
+            #        lambda fd, action: instance._multi.socket_all()
 
             # libcurl has bugs that sometimes cause it to not report all
             # relevant file descriptors and timeouts to TIMERFUNCTION/
             # SOCKETFUNCTION.  Mitigate the effects of such bugs by
             # forcing a periodic scan of all active requests.
-            instance._force_timeout_callback = ioloop.PeriodicCallback(
-                instance._handle_force_timeout, 1000, io_loop=io_loop)
-            instance._force_timeout_callback.start()
+            #instance._force_timeout_callback = ioloop.PeriodicCallback(
+            #    instance._handle_force_timeout, 1000, io_loop=io_loop)
+            #instance._force_timeout_callback.start()
 
             return instance
 
@@ -178,7 +282,7 @@ class AsyncHTTPClient(object):
             request = HTTPRequest(url=request, **kwargs)
         self._requests.append((request, stack_context.wrap(callback)))
         self._process_queue()
-        self._set_timeout(0)
+        #self._set_timeout(0)
 
     def _handle_socket(self, event, fd, multi, data):
         """Called by libcurl when it wants to change the file descriptors
@@ -284,6 +388,12 @@ class AsyncHTTPClient(object):
             if num_q == 0:
                 break
         self._process_queue()
+    
+    def _send_request(self, conn, fd, event):
+        str = _setup_header_str(conn)
+        self.io_loop.remove_handler(fd)
+        conn.stream =  iostream.IOStream(conn.socket)
+        conn.write(str)
 
     def _process_queue(self):
         with stack_context.NullContext():
@@ -291,23 +401,46 @@ class AsyncHTTPClient(object):
                 started = 0
                 while self._free_list and self._requests:
                     started += 1
-                    curl = self._free_list.pop()
+                    conn = self._free_list.pop()
                     (request, callback) = self._requests.popleft()
-                    curl.info = {
-                        "headers": httputil.HTTPHeaders(),
-                        "buffer": cStringIO.StringIO(),
-                        "request": request,
-                        "callback": callback,
-                        "curl_start_time": time.time(),
-                    }
+                    # parse url
+                    parse_result = urlparse.urlparse(request.url)
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    # set non-blocking
+                    s.setblocking(0)
+                    # update connection
+                    conn.socket = s
+                    conn.request = request
+                    conn.netloc = parse_result.netloc
+                    conn.callback = callback
+                    port = parse_result.port or 80
+                    try:
+                        s.connect((parse_result.netloc, port))
+                        # if ready, send request
+                        self._send_request(conn)
+                    except socket.error as e:
+                        # check if still in progress
+                        if e[0] == errno.EINPROGRESS:
+                            callback = functools.partial(self._send_request, conn)
+                            self.io_loop.add_handler(s.fileno(), callback, ioloop.IOLoop.WRITE)
+                        else:
+                            # something wrong
+                            pass
+                    #curl.info = {
+                    #    "headers": httputil.HTTPHeaders(),
+                    #    "buffer": cStringIO.StringIO(),
+                    #    "request": request,
+                    #    "callback": callback,
+                    #    "curl_start_time": time.time(),
+                    #}
                     # Disable IPv6 to mitigate the effects of this bug
                     # on curl versions <= 7.21.0
                     # http://sourceforge.net/tracker/?func=detail&aid=3017819&group_id=976&atid=100976
-                    if pycurl.version_info()[2] <= 0x71500:  # 7.21.0
-                        curl.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V4)
-                    _curl_setup_request(curl, request, curl.info["buffer"],
-                                        curl.info["headers"])
-                    self._multi.add_handle(curl)
+                    #if pycurl.version_info()[2] <= 0x71500:  # 7.21.0
+                    #    curl.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V4)
+                    #_curl_setup_request(curl, request, curl.info["buffer"],
+                    #                    curl.info["headers"])
+                    #self._multi.add_handle(curl)
 
                 if not started:
                     break
@@ -372,8 +505,8 @@ class HTTPRequest(object):
             timestamp = calendar.timegm(if_modified_since.utctimetuple())
             headers["If-Modified-Since"] = email.utils.formatdate(
                 timestamp, localtime=False, usegmt=True)
-        if "Pragma" not in headers:
-            headers["Pragma"] = ""
+        #if "Pragma" not in headers:
+        #    headers["Pragma"] = ""
         # libcurl's magic "Expect: 100-continue" behavior causes delays
         # with servers that don't support it (which include, among others,
         # Google's OpenID endpoint).  Additionally, this behavior has
@@ -382,8 +515,8 @@ class HTTPRequest(object):
         # which increases the delays.  It's more trouble than it's worth,
         # so just turn off the feature (yes, setting Expect: to an empty
         # value is the official way to disable this)
-        if "Expect" not in headers:
-            headers["Expect"] = ""
+        #if "Expect" not in headers:
+        #    headers["Expect"] = ""
         self.url = _utf8(url)
         self.method = method
         self.headers = headers
@@ -421,7 +554,7 @@ class HTTPResponse(object):
         plus 'queue', which is the delay (if any) introduced by waiting for
         a slot under AsyncHTTPClient's max_clients setting.
     """
-    def __init__(self, request, code, headers={}, buffer=None,
+    def __init__(self, request, code, headers=None, buffer=None,
                  effective_url=None, error=None, request_time=None,
                  time_info={}):
         self.request = request
@@ -499,6 +632,16 @@ def _curl_create(max_simultaneous_connections=None):
     curl.setopt(pycurl.MAXCONNECTS, max_simultaneous_connections or 5)
     return curl
 
+
+def _setup_header_str(conn):
+    request = conn.request
+    list = ["%s %s %s" % (request.method, urlparse.urlparse(request.url).path, "HTTP/1.1")]
+    request.headers.add("Host", conn.netloc)
+    request.headers.add("User-Agent", "Mozilla/5.0")
+    list.extend(['%s: %s' % (k,v) for (k,v) in request.headers.get_all()])
+    # add extra '\r\n\r\n'
+    list.extend(['', ''])
+    return "\r\n".join(list)
 
 def _curl_setup_request(curl, request, buffer, headers):
     curl.setopt(pycurl.URL, request.url)
